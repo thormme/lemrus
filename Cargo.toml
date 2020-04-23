@@ -1,0 +1,19 @@
+[package]
+name = "lemrus"
+version = "0.1.0"
+authors = ["Michael Schroder <thormme@yahoo.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+image = "0.23.3"
+piston = "0.49.0"
+piston2d-graphics = "0.36.0"
+piston2d-sprite = "0.59.0"
+pistoncore-glutin_window = "0.63.0"
+piston2d-opengl_graphics = "0.72.0"
+piston_window = "0.107.0"
+rand = "0.7.3"
+vecmath = "1.0.0"
+bitflags = "1.2.1"
