@@ -8,6 +8,7 @@ extern crate sprite;
 #[macro_use]
 extern crate bitflags;
 
+use piston_window::types::SourceRectangle;
 use crate::piston::EventLoop;
 use crate::graphics::Transformed;
 use piston::{Event};
@@ -24,7 +25,7 @@ use std::collections::HashMap;
 use sprite::Sprite;
 use std::rc::Rc;
 
-const SolidBreakablePixel: Rgba<u8> = Rgba([255, 255, 255, 255]);
+const SOLID_BREAKABLE_PIXEL: Rgba<u8> = Rgba([255, 255, 255, 255]);
 const EMPTY_PIXEL: Rgba<u8> = Rgba([0, 0, 0, 255]);
 
 trait CollisionMap {
@@ -52,6 +53,7 @@ impl CollisionMap for ImageBuffer<Rgba<u8>, Vec<u8>> {
 trait CollisionMapPixel {
     fn is_solid(&self) -> bool;
     fn is_breakable(&self) -> bool;
+    fn is_empty(&self) -> bool;
 }
 
 impl CollisionMapPixel for Rgba<u8> {
@@ -61,19 +63,60 @@ impl CollisionMapPixel for Rgba<u8> {
     fn is_breakable(&self) -> bool {
         self[2] != 0
     }
+    fn is_empty(&self) -> bool {
+        *self == EMPTY_PIXEL
+    }
 }
 
 bitflags! {
     struct Actions: u32 {
         const WALK = 0x01;
         const DIG = 0x02;
+        const BRIDGE = 0x04;
     }
 }
 
-// pub struct Animation {
-//     sprite_id: String,
-//
-// }
+pub struct AnimationFrame {
+    sprite_id: String,
+    delay: u64, // Time to next frame in ms
+    next_frame_id: String,
+}
+
+pub struct Animation {
+    frame_time: u64, // ms since frame start
+    current_frame_id: String,
+    entered_new_frame: bool,
+}
+
+impl Animation {
+    fn new(frame_id: String, frame_time: u64) -> Animation {
+        Animation {
+            frame_time: frame_time, // ms since frame start
+            current_frame_id: frame_id,
+            entered_new_frame: true,
+        }
+    }
+
+    fn update(&mut self, update_args: &UpdateArgs, animations: &HashMap<String, AnimationFrame>) {
+        self.frame_time += (update_args.dt * 1000.0) as u64;
+        self.entered_new_frame = false;
+        if let Some(current_frame) = animations.get(&self.current_frame_id) {
+            if self.frame_time >= current_frame.delay {
+                self.frame_time -= current_frame.delay;
+                self.entered_new_frame = true;
+                self.current_frame_id = current_frame.next_frame_id.clone();
+            }
+        }
+    }
+
+    fn entered_frame(&self, frame_id: String) -> bool{
+        self.entered_new_frame && self.current_frame_id == frame_id
+    }
+
+    // fn draw() {
+    //
+    // }
+}
 
 enum FacingDirection {
     Left,
@@ -85,6 +128,7 @@ pub struct Lemming {
     y: u32,
     direction: FacingDirection,
     actions: Actions,
+    animation: Animation,
 }
 
 impl Lemming {
@@ -93,7 +137,8 @@ impl Lemming {
             x,
             y,
             direction,
-            actions: Actions::DIG | Actions::WALK,
+            actions: Actions::WALK,
+            animation: Animation::new("lemming_walk_0".to_string(), 0),
         }
     }
 
@@ -125,6 +170,9 @@ impl Lemming {
     }
 
     fn walk(&mut self, environment: &ImageBuffer<Rgba<u8>, Vec<u8>>) {
+        if !(self.animation.entered_frame("lemming_walk_0".to_string()) || self.animation.entered_frame("lemming_walk_1".to_string())) {
+            return;
+        }
         if self.on_map(environment) {
             if self.on_ground(environment) {
                 if environment.get_pixel_safe((self.x as i32 + self.x_speed()) as u32, self.y).unwrap_or(&EMPTY_PIXEL).is_solid() {
@@ -163,7 +211,42 @@ impl Lemming {
         }
     }
 
-    fn update(&mut self, environment: &mut ImageBuffer<Rgba<u8>, Vec<u8>>) {
+    fn bridge(&mut self, environment: &mut ImageBuffer<Rgba<u8>, Vec<u8>>) {
+        if self.on_map(environment) {
+            if !self.on_ground(environment) {
+                //self.actions.remove(Actions::BRIDGE);
+                return;
+            }
+            for x in 1..7 {
+                if let Ok(bridge_pixel) = environment.get_pixel_mut_safe(self.x + x, self.y) {
+                    if bridge_pixel.is_empty() {
+                        *bridge_pixel = SOLID_BREAKABLE_PIXEL;
+                    }
+                }
+            }
+            let mut can_climb = true; // TODO: Check for all intermediate pixels
+            if let Ok(bridge_pixel) = environment.get_pixel_mut_safe(self.x + 2, self.y) {
+                if !bridge_pixel.is_solid() {
+                    can_climb = false;
+                }
+            } else {
+                can_climb = false;
+            }
+            if let Ok(air_pixel) = environment.get_pixel_mut_safe(self.x + 2, self.y - 1) {
+                if air_pixel.is_solid() {
+                    can_climb = false;
+                }
+            } else {
+                can_climb = false;
+            }
+            if can_climb {
+                self.x += 2;
+                self.y -= 1;
+            }
+        }
+    }
+
+    fn update(&mut self, update_args: &UpdateArgs, environment: &mut ImageBuffer<Rgba<u8>, Vec<u8>>, animations: &HashMap<String, AnimationFrame>) {
         if self.actions.contains(Actions::WALK) {
             self.walk(environment);
         }
@@ -171,6 +254,10 @@ impl Lemming {
         if self.actions.contains(Actions::DIG) {
             self.dig(environment);
         }
+        if self.actions.contains(Actions::BRIDGE) {
+            self.bridge(environment);
+        }
+        self.animation.update(update_args, animations);
     }
 }
 
@@ -181,9 +268,23 @@ pub struct App {
     texture_context: G2dTextureContext,
     lemmings: Vec<Lemming>,
     sprites: HashMap<String, Sprite<G2dTexture>>,
+    animations: HashMap<String, AnimationFrame>,
 }
 
 impl App {
+    fn add_sprite_from_file(&mut self, sprite_id: String, file_path: &Path, anchor: (f64, f64), rect: SourceRectangle) {
+        let image = im::open(file_path).unwrap().into_rgba();
+        let texture = Rc::from(Texture::from_image(
+                &mut self.texture_context,
+                &image,
+                &TextureSettings::new().filter(Filter::Nearest),
+            ).unwrap());
+
+        let mut lemming_sprite = Sprite::from_texture_rect(texture, rect);
+        lemming_sprite.set_anchor(anchor.0, anchor.1);
+        self.sprites.insert(sprite_id, lemming_sprite);
+    }
+
     fn render(&mut self, args: &RenderArgs, event: &Event) {
 
         const background_color: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
@@ -197,6 +298,7 @@ impl App {
         let texture_context = &mut self.texture_context;
         let lemmings = &self.lemmings;
         let sprites = &self.sprites;
+        let animations = &self.animations;
 
         let window_scale = [
             self.window.window.ctx.window().get_inner_size().unwrap().width as f64 / self.canvas.width() as f64,
@@ -218,7 +320,7 @@ impl App {
                 let transform = window_transform
                     .trans(lemming.x.into(), lemming.y.into());
 
-                sprites["lemming"].draw(transform, gl);
+                sprites[&animations[&lemming.animation.current_frame_id].sprite_id].draw(transform, gl);
                 //image(&sprites["lemming"], transform, gl);
             }
         });
@@ -260,8 +362,10 @@ impl App {
 
         //self._step_environment_gravity();
         let environment = &mut self.canvas;
+        let animations = &self.animations;
+        //self.lemmings.push(Lemming::new(20, 20, FacingDirection::Left));
         for lemming in &mut self.lemmings {
-            lemming.update(environment);
+            lemming.update(args, environment, animations);
         }
     }
 }
@@ -300,22 +404,27 @@ fn main() {
         texture_context: texture_context,
         lemmings: Vec::new(),
         sprites: HashMap::new(),
+        animations: HashMap::new(),
     };
 
-    let lemming_image = im::open("lem.png").unwrap().into_rgba();
-    let lemming_texture = Rc::from(Texture::from_image(
-            &mut app.texture_context,
-            &lemming_image,
-            &texture_settings,
-        ).unwrap());
+    app.add_sprite_from_file("lemming".to_string(), Path::new("lem.png"), (0.5, 0.9), [0.0, 0.0, 5.0, 10.0]);
+    app.add_sprite_from_file("lemming_walk_1".to_string(), Path::new("lemming_walk_1.png"), (0.5, 0.9), [0.0, 0.0, 5.0, 10.0]);
 
-    let mut lemming_sprite = Sprite::from_texture(lemming_texture);
-    lemming_sprite.set_anchor(0.5, 0.9);
-    app.sprites.insert("lemming".to_string(), lemming_sprite);
+    app.animations.insert("lemming_walk_0".to_string(), AnimationFrame {
+        sprite_id: "lemming".to_string(),
+        delay: 80, // Time to next frame in ms
+        next_frame_id: "lemming_walk_1".to_string(),
+    });
+
+    app.animations.insert("lemming_walk_1".to_string(), AnimationFrame {
+        sprite_id: "lemming_walk_1".to_string(),
+        delay: 80, // Time to next frame in ms
+        next_frame_id: "lemming_walk_0".to_string(),
+    });
 
     app.lemmings.push(Lemming::new(100, 50, FacingDirection::Right));
 
-    let mut events = Events::new(EventSettings::new().ups(20u64));
+    let mut events = Events::new(EventSettings::new().ups(60u64));
     while let Some(e) = events.next(&mut app.window) {
         if let Some(args) = e.render_args() {
             app.render(&args, &e);
